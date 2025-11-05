@@ -3,9 +3,10 @@ from azure.storage.blob import BlobClient
 
 app = func.FunctionApp()
 
-# ----- Config from env -----
+# ========= Env / Config (BASE URL ONLY — no resource here) =========
+# Example: API_URL = "https://stagingapi.smokeball.co.uk"
 TOKEN_URL     = os.getenv("TOKEN_URL")
-API_URL       = os.getenv("API_URL")
+API_URL       = os.getenv("API_URL")  # MUST be base only, e.g., https://stagingapi.smokeball.co.uk
 CLIENT_ID     = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 API_KEY       = os.getenv("API_KEY")
@@ -24,19 +25,26 @@ lock_blob = BlobClient.from_connection_string(
     AZURE_STORAGE_CONNECTION_STRING, LOCK_CONTAINER, LOCK_BLOB_NAME
 )
 
-# ----- Helpers -----
+# ========= Helpers =========
 def _load_state():
     try:
         data = state_blob.download_blob().readall()
         return json.loads(data)
     except Exception:
-        return {}  # first run
+        return {}  # first run / missing blob
 
 def _save_state(state: dict):
     state_blob.upload_blob(json.dumps(state), overwrite=True)
 
+def _ensure_lock_blob():
+    try:
+        lock_blob.get_blob_properties()
+    except Exception:
+        lock_blob.upload_blob(b"", overwrite=True)
+
 def _acquire_lock(timeout_seconds=15):
     try:
+        _ensure_lock_blob()
         return lock_blob.acquire_lease(timeout=timeout_seconds)
     except Exception:
         return None
@@ -48,7 +56,8 @@ def _release_lock(lease):
         except Exception:
             pass
 
-def _now(): return time.time()
+def _now():
+    return time.time()
 
 def _exchange_refresh_for_access(refresh_token: str):
     payload = {
@@ -75,6 +84,7 @@ def _get_valid_access_token():
 
     lease = _acquire_lock()
     try:
+        # double-check after acquiring the lease
         st = _load_state()
         access = st.get("access_token")
         exp    = st.get("expires_at", 0)
@@ -88,7 +98,7 @@ def _get_valid_access_token():
 
         access, new_refresh, expires_in = _exchange_refresh_for_access(refresh)
         st["access_token"]  = access
-        st["expires_at"]    = _now() + int(expires_in) - 60
+        st["expires_at"]    = _now() + int(expires_in) - 60  # 60s safety margin
         if new_refresh:
             st["refresh_token"] = new_refresh
         _save_state(st)
@@ -97,47 +107,73 @@ def _get_valid_access_token():
     finally:
         _release_lock(lease)
 
-def _call_smokeball(access_token: str, limit=500):
-    headers = {
-        "x-api-key": API_KEY,
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    all_contacts = []
+def _fetch_all_pages(url: str, headers: dict):
+    """
+    Fixed limit=500, offset-based pagination identical to your current approach.
+    Expects array under 'value'.
+    """
+    LIMIT = 500
+    all_rows = []
     offset = 0
+
     while True:
-        params = {"limit": limit, "offset": offset}
-        resp = requests.get(API_URL, headers=headers, params=params, timeout=240)
+        params = {"limit": LIMIT, "offset": offset}
+        resp = requests.get(url, headers=headers, params=params, timeout=240)
+
         if resp.status_code == 401:
+            # Signal to caller to refresh once and retry
             raise PermissionError("ACCESS_EXPIRED")
         if resp.status_code >= 400:
             logging.error(f"Upstream error {resp.status_code}: {resp.text}")
             resp.raise_for_status()
 
-        data = resp.json()
-        contacts = data.get("value", [])
-        all_contacts.extend(contacts)
-        if len(contacts) < limit:
+        js = resp.json()
+        rows = js.get("value", [])
+        all_rows.extend(rows)
+
+        if len(rows) < LIMIT:
             break
-        offset += limit
 
-    return {"contacts": all_contacts}
+        offset += LIMIT
 
- 
-# ====== HTTP Route ======
-@app.route(route="APICallingSmokeball", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
-def APICallingSmokeball(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("APICallingSmokeball invoked.")
+    return all_rows
+
+# ========= HTTP Route (generic resource) =========
+# Call like:  GET /api/smokeball/contacts
+#             GET /api/smokeball/invoices
+#             GET /api/smokeball/employees
+@app.route(route="smokeball/{resource}", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
+def smokeball_resource(req: func.HttpRequest) -> func.HttpResponse:
+    resource = (req.route_params.get("resource") or "").strip().strip("/").lower()
+    if not resource:
+        return func.HttpResponse(
+            json.dumps({"error": "missing resource in route"}),
+            mimetype="application/json", status_code=400
+        )
+
+    # Build full URL from base + resource
+    # e.g., API_URL="https://stagingapi.smokeball.co.uk" and resource="contacts"
+    url = f"{API_URL.rstrip('/')}/{resource}"
+
     try:
         access = _get_valid_access_token()
-        try:
-            data = _call_smokeball(access, limit=500)
-        except PermissionError:
-            access = _get_valid_access_token()
-            data = _call_smokeball(access, limit=500)
+        headers = {
+            "x-api-key": API_KEY,
+            "Authorization": f"Bearer {access}",
+            "Content-Type": "application/json",
+        }
 
-        return func.HttpResponse(json.dumps(data), mimetype="application/json", status_code=200)
+        try:
+            rows = _fetch_all_pages(url, headers)
+        except PermissionError:
+            # token may have expired mid-run; refresh once and retry
+            access = _get_valid_access_token()
+            headers["Authorization"] = f"Bearer {access}"
+            rows = _fetch_all_pages(url, headers)
+
+        body = {"resource": resource, "count": len(rows), "rows": rows}
+        return func.HttpResponse(json.dumps(body), mimetype="application/json", status_code=200)
+
     except Exception as e:
-        logging.exception("APICallingSmokeball failed")
+        logging.exception("smokeball_resource failed")
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=502)
