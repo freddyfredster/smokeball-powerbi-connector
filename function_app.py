@@ -1,30 +1,40 @@
-import logging
-import os
-import json
-import time
-import requests
-import azure.functions as func
-
+import logging, os, json, time, requests, azure.functions as func
 from azure.storage.blob import BlobClient
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import requests
+# One session for the whole function app process (connection pooling + keep-alive)
+SESSION = requests.Session()
+
+_retry = Retry(
+    total=6,
+    connect=6,
+    read=6,
+    backoff_factor=0.7,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+
+adapter = HTTPAdapter(max_retries=_retry, pool_connections=50, pool_maxsize=50)
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
 
 app = func.FunctionApp()
 
-# ========= Env / Config =========
+# ========= Env / Config (BASE URL ONLY — no resource here) =========
+# Example: API_URL = "https://stagingapi.smokeball.co.uk"
 TOKEN_URL     = os.getenv("TOKEN_URL")
-API_URL       = os.getenv("API_URL")  # base only, e.g. https://stagingapi.smokeball.co.uk
+API_URL       = os.getenv("API_URL")  # MUST be base only, e.g., https://stagingapi.smokeball.co.uk
 CLIENT_ID     = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 API_KEY       = os.getenv("API_KEY")
 
+# Storage for token state + lock
 AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 STATE_CONTAINER = os.getenv("STATE_CONTAINER", "tokens")
 STATE_BLOB_NAME = os.getenv("STATE_BLOB_NAME", "smokeball-token-state.json")
 LOCK_CONTAINER  = os.getenv("LOCK_CONTAINER",  "locks")
 LOCK_BLOB_NAME  = os.getenv("LOCK_BLOB_NAME",  "smokeball-token.lock")
-
-if not all([TOKEN_URL, API_URL, CLIENT_ID, CLIENT_SECRET, API_KEY, AZURE_STORAGE_CONNECTION_STRING]):
-    logging.warning("One or more required environment variables are missing.")
 
 state_blob = BlobClient.from_connection_string(
     AZURE_STORAGE_CONNECTION_STRING, STATE_CONTAINER, STATE_BLOB_NAME
@@ -33,7 +43,7 @@ lock_blob = BlobClient.from_connection_string(
     AZURE_STORAGE_CONNECTION_STRING, LOCK_CONTAINER, LOCK_BLOB_NAME
 )
 
-# ========= Helpers: token state / lock =========
+# ========= Helpers =========
 def _load_state():
     try:
         data = state_blob.download_blob().readall()
@@ -106,7 +116,7 @@ def _get_valid_access_token():
 
         access, new_refresh, expires_in = _exchange_refresh_for_access(refresh)
         st["access_token"]  = access
-        st["expires_at"]    = _now() + int(expires_in) - 60  # safety margin
+        st["expires_at"]    = _now() + int(expires_in) - 60  # 60s safety margin
         if new_refresh:
             st["refresh_token"] = new_refresh
         _save_state(st)
@@ -115,17 +125,9 @@ def _get_valid_access_token():
     finally:
         _release_lock(lease)
 
-def _build_headers(access_token: str):
-    return {
-        "x-api-key": API_KEY,
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-# ========= Helpers: paging =========
 def _fetch_all_pages(url: str, headers: dict):
     """
-    Fixed limit=500, offset-based pagination.
+    Fixed limit=500, offset-based pagination identical to your current approach.
     Expects array under 'value'.
     """
     LIMIT = 500
@@ -137,14 +139,8 @@ def _fetch_all_pages(url: str, headers: dict):
         resp = requests.get(url, headers=headers, params=params, timeout=240)
 
         if resp.status_code == 401:
+            # Signal to caller to refresh once and retry
             raise PermissionError("ACCESS_EXPIRED")
-
-        if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            sleep_s = float(retry_after) if retry_after else 2
-            time.sleep(sleep_s)
-            continue
-
         if resp.status_code >= 400:
             logging.error(f"Upstream error {resp.status_code}: {resp.text}")
             resp.raise_for_status()
@@ -160,91 +156,10 @@ def _fetch_all_pages(url: str, headers: dict):
 
     return all_rows
 
-# ========= Optimized helpers: per-matter child fetch =========
-def _get_with_retry(session: requests.Session, url: str, headers: dict, timeout=240, max_retries=6):
-    """
-    Retries for 401 (refresh token) and 429 (backoff, respects Retry-After if present).
-    """
-    last_resp = None
-
-    for attempt in range(max_retries):
-        resp = session.get(url, headers=headers, timeout=timeout)
-        last_resp = resp
-
-        if resp.status_code == 401:
-            # refresh access token and retry
-            new_access = _get_valid_access_token()
-            headers = dict(headers)
-            headers["Authorization"] = f"Bearer {new_access}"
-            continue
-
-        if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            # exponential backoff up to 30s
-            sleep_s = float(retry_after) if retry_after else min(2 ** attempt, 30)
-            time.sleep(sleep_s)
-            continue
-
-        return resp
-
-    return last_resp
-
-def _fetch_items_for_matter(session: requests.Session, matter_id: str, endpoint: str, headers: dict):
-    """
-    Fetch child items for one matter.
-    NOTE: If Smokeball paginates these endpoints too, switch to _fetch_all_pages here.
-    """
-    url = f"{API_URL.rstrip('/')}/matters/{matter_id}/{endpoint}"
-    resp = _get_with_retry(session, url, headers=headers)
-
-    if resp is None:
-        return []
-
-    if resp.status_code == 200:
-        raw = resp.json()
-        return raw.get("value", []) if isinstance(raw, dict) else (raw or [])
-
-    logging.warning(
-        f"Failed for matter {matter_id} endpoint {endpoint}: "
-        f"{resp.status_code} {resp.text[:200]}"
-    )
-    return []
-
-def _fetch_related_for_matters(endpoint: str, max_workers: int = 8):
-    """
-    Efficient N+1 fetch:
-      - fetch all matters once (paged)
-      - fetch /matters/{id}/{endpoint} in parallel (bounded)
-      - reuse HTTP connections via Session
-      - handle 401/429 with retries/backoff
-    """
-    access = _get_valid_access_token()
-    headers = _build_headers(access)
-
-    matters = _fetch_all_pages(f"{API_URL.rstrip('/')}/matters", headers=headers)
-
-    all_data = []
-    with requests.Session() as session:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(_fetch_items_for_matter, session, m["id"], endpoint, headers)
-                for m in matters
-                if "id" in m
-            ]
-
-            for fut in as_completed(futures):
-                items = fut.result()
-                if items:
-                    all_data.extend(items)
-
-    return all_data
-
-# ========= Routes =========
-
-# Generic resource:
-# GET /api/smokeball/contacts
-# GET /api/smokeball/employees
-# GET /api/smokeball/matters
+# ========= HTTP Route (generic resource) =========
+# Call like:  GET /api/smokeball/contacts
+#             GET /api/smokeball/invoices
+#             GET /api/smokeball/employees
 @app.route(route="smokeball/{resource}", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def smokeball_resource(req: func.HttpRequest) -> func.HttpResponse:
     resource = (req.route_params.get("resource") or "").strip().strip("/").lower()
@@ -254,17 +169,24 @@ def smokeball_resource(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json", status_code=400
         )
 
+    # Build full URL from base + resource
+    # e.g., API_URL="https://stagingapi.smokeball.co.uk" and resource="contacts"
     url = f"{API_URL.rstrip('/')}/{resource}"
 
     try:
         access = _get_valid_access_token()
-        headers = _build_headers(access)
+        headers = {
+            "x-api-key": API_KEY,
+            "Authorization": f"Bearer {access}",
+            "Content-Type": "application/json",
+        }
 
         try:
             rows = _fetch_all_pages(url, headers)
         except PermissionError:
+            # token may have expired mid-run; refresh once and retry
             access = _get_valid_access_token()
-            headers = _build_headers(access)
+            headers["Authorization"] = f"Bearer {access}"
             rows = _fetch_all_pages(url, headers)
 
         body = {"resource": resource, "count": len(rows), "rows": rows}
@@ -275,37 +197,63 @@ def smokeball_resource(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=502)
 
 
-# Generic matter-child route (covers invoices/roles/fees + future endpoints):
-# GET /api/smokeball/matters/invoices
-# GET /api/smokeball/matters/roles
-# GET /api/smokeball/matters/fees
-@app.route(route="smokeball/matters/{endpoint}", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
-def smokeball_matters_child(req: func.HttpRequest) -> func.HttpResponse:
-    endpoint = (req.route_params.get("endpoint") or "").strip().strip("/").lower()
-    if not endpoint:
-        return func.HttpResponse(
-            json.dumps({"error": "missing endpoint"}), mimetype="application/json", status_code=400
-        )
-
-    # Optional allow-list. Add more endpoints as needed.
-    allowed = {"invoices", "roles", "fees"}
-    if endpoint not in allowed:
-        return func.HttpResponse(
-            json.dumps({"error": f"unsupported endpoint '{endpoint}'", "allowed": sorted(list(allowed))}),
-            mimetype="application/json", status_code=400
-        )
-
-    try:
-        data = _fetch_related_for_matters(endpoint)
-        body = {"resource": f"matters/{endpoint}", "count": len(data), "rows": data}
-        return func.HttpResponse(json.dumps(body), mimetype="application/json", status_code=200)
-
-    except Exception as e:
-        logging.exception("smokeball_matters_child failed")
-        return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=502)
 
 
-# Backwards-compatible routes (so your existing URLs still work)
+# ========= New Matter-Related Functions =========
+
+def _fetch_related_for_matters(endpoint):
+    access = _get_valid_access_token()
+    headers = {
+        "x-api-key": API_KEY,
+        "Authorization": f"Bearer {access}",
+        "Content-Type": "application/json",
+    }
+
+    base = API_URL.rstrip("/")
+
+    matters = _fetch_all_pages(f"{base}/matters", headers=headers)
+    all_data = []
+
+    for matter in matters:
+        matter_id = matter["id"]
+        url = f"{base}/matters/{matter_id}/{endpoint}"
+
+        # retry a couple times for transient DNS / connection issues
+        for attempt in range(3):
+            try:
+                resp = SESSION.get(url, headers=headers, timeout=60)
+                break
+            except requests.exceptions.RequestException as ex:
+                logging.warning(f"Network/DNS error calling {url} (attempt {attempt+1}/3): {ex}")
+                time.sleep(1.5 * (attempt + 1))
+        else:
+            # exhausted attempts
+            continue
+
+        if resp.status_code == 401:
+            # refresh once, retry
+            access = _get_valid_access_token()
+            headers["Authorization"] = f"Bearer {access}"
+            resp = SESSION.get(url, headers=headers, timeout=60)
+
+        if resp.status_code == 429:
+            time.sleep(2)
+            resp = SESSION.get(url, headers=headers, timeout=60)
+
+        if resp.status_code != 200:
+            logging.warning(f"Failed for matter {matter_id} endpoint {endpoint}: {resp.status_code}")
+            continue
+
+        raw = resp.json()
+        items = raw.get("roles", []) if endpoint == "roles" else raw.get("value", [])
+        all_data.extend(items)
+
+        time.sleep(0.1)  # keep it gentle on the API
+
+    return all_data
+
+
+ 
 @app.route(route="smokeball/invoices", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def fetch_all_invoices_func(req: func.HttpRequest) -> func.HttpResponse:
     try:
@@ -315,7 +263,7 @@ def fetch_all_invoices_func(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.exception("fetch_all_invoices_func failed")
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=502)
-
+ 
 @app.route(route="smokeball/roles", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def fetch_all_roles_func(req: func.HttpRequest) -> func.HttpResponse:
     try:
@@ -325,7 +273,7 @@ def fetch_all_roles_func(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.exception("fetch_all_roles_func failed")
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=502)
-
+ 
 @app.route(route="smokeball/fees", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def fetch_all_fees_func(req: func.HttpRequest) -> func.HttpResponse:
     try:
