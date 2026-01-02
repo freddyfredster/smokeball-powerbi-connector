@@ -263,6 +263,17 @@ def fetch_all_invoices_func(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.exception("fetch_all_invoices_func failed")
         return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=502)
+
+@app.route(route="smokeball/expenses", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def fetch_all_expenses_func(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        data = _fetch_related_for_matters("expenses")
+        body = {"resource": "expenses", "count": len(data), "rows": data}
+        return func.HttpResponse(json.dumps(body), mimetype="application/json", status_code=200)
+    except Exception as e:
+        logging.exception("fetch_all_expenses_func failed")
+        return func.HttpResponse(json.dumps({"error": str(e)}), mimetype="application/json", status_code=502)
+
  
 @app.route(route="smokeball/roles", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def fetch_all_roles_func(req: func.HttpRequest) -> func.HttpResponse:
